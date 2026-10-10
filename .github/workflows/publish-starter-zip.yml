@@ -1,0 +1,90 @@
+name: 스타터킷 ZIP 릴리스
+
+# DearKim/DS-Starter(비공개)의 education 브랜치에 push 가 생기면, 그쪽 워크플로가
+# release-request.json 에 그 커밋을 적어 이 저장소 main 에 push 한다.
+# 여기서는 그 커밋으로 학생용 ZIP 을 만들고, 내용이 바뀐 경우에만 새 릴리스를 올린다.
+# 사전 준비 페이지의 다운로드 링크는 releases/latest/download/DS-Starter.zip 이다.
+on:
+  push:
+    branches: [main]
+    paths: [release-request.json]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "릴리스를 만들지 않고 ZIP 생성과 비교만 확인"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: starter-zip-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 요청 파일 받기
+        uses: actions/checkout@v4
+
+      - name: 요청한 커밋 읽기
+        id: req
+        run: echo "commit=$(jq -r .commit release-request.json)" >> "$GITHUB_OUTPUT"
+
+      - name: DS-Starter 받기 (읽기 전용 배포 키)
+        uses: actions/checkout@v4
+        with:
+          repository: DearKim/DS-Starter
+          ref: ${{ steps.req.outputs.commit }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: source
+          persist-credentials: false
+
+      - name: 학생용 ZIP 만들기
+        id: zip
+        working-directory: source
+        run: |
+          set -euo pipefail
+          git archive --format=zip --prefix=DS-Starter/ HEAD -o "$RUNNER_TEMP/DS-Starter.zip"
+          echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(TZ=Asia/Seoul git log -1 --format=%cd --date=format-local:%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: 최신 릴리스와 비교
+        id: cmp
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: education-${{ steps.zip.outputs.short }}
+        run: |
+          set -euo pipefail
+          # 파일 이름·크기·CRC 로만 비교한다. 커밋 시각과 ZIP 주석(커밋 id)은 비교하지 않는다.
+          entries() { unzip -v "$1" | awk 'NF >= 8 && $1 ~ /^[0-9]+$/ { name = $8; for (i = 9; i <= NF; i++) name = name " " $i; print $7, $1, name }' | sort; }
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "이미 릴리스된 커밋이다: $TAG"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/latest"
+          if gh release download -R "$GITHUB_REPOSITORY" --pattern DS-Starter.zip --dir "$RUNNER_TEMP/latest" 2>/dev/null; then
+            if diff <(entries "$RUNNER_TEMP/latest/DS-Starter.zip") <(entries "$RUNNER_TEMP/DS-Starter.zip") > "$RUNNER_TEMP/diff.txt"; then
+              echo "최신 릴리스와 학생용 ZIP 내용이 같다. 새 릴리스를 만들지 않는다."
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "최신 릴리스와 달라진 항목:"
+            head -40 "$RUNNER_TEMP/diff.txt"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: 릴리스 만들기
+        if: steps.cmp.outputs.changed == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.zip.outputs.short }}
+          DATE: ${{ steps.zip.outputs.date }}
+        run: |
+          gh release create "education-$SHORT" "$RUNNER_TEMP/DS-Starter.zip" -R "$GITHUB_REPOSITORY" \
+            --title "DS-Starter $SHORT · $DATE" \
+            --notes "education 브랜치 $SHORT 의 스타터킷 ZIP 입니다. 압축을 풀면 DS-Starter 폴더가 생깁니다." \
+            --latest
